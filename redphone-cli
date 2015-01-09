@@ -3,232 +3,217 @@
 require 'rubygems'
 require 'commander'
 require 'logger'
-require 'open3'
-require 'ostruct'
+require 'mixlib/shellout'
 require 'redphone/pagerduty'
 require 'yaml'
 
-logger = Logger.new(STDOUT)
-logger.level = Logger::WARN
+$logger = Logger.new(STDOUT)
+$logger.level = Logger::WARN
 
-class OptionValidationError < Exception
+def global_defaults
+  { config_file: '/etc/redphone/redphone.yml' }
 end
 
-def default_config(service, path = nil)
-  path ||= File.join(Dir.home, '.redphone.yml')
-  if File.exist?(path)
-    options_from_yaml(service, path)
-  else
-    {}
+def hostname
+  %x(hostname).chomp
+end
+
+def make_defaults(options={})
+  global_defaults.merge(options)
+end
+
+module RedphoneCli
+  class OptionValidationError < Exception
   end
-end
 
-def options_from_yaml(service, path)
-  config = YAML.load_file(path)
-  config[service] || {}
-end
+  class Command
+    class << self
+      attr_accessor :argument_validations
+      attr_accessor :config_section
+      attr_accessor :option_validations
+    end
 
-def handle_option_error(e)
-  puts e
-  exit 1
-end
+    def self.inherited(subclass)
+      %w(argument_validations config_section option_validations).each do |var|
+        subclass.send :"#{var}=", send(var)
+      end
+    end
 
-def pagerduty_options(options, merge_options = {})
-  {
-    service_key: options.api_key,
-  }.merge(merge_options)
-end
+    def self.imports_from_config(section)
+      @config_section = section
+    end
 
-def run_command(*cmd)
-  stdout, stderr, status = Open3.capture3(*cmd)
-  OpenStruct.new({
-    stderr: (stderr unless stderr == ''),
-    stdout: (stdout unless stdout == ''),
-    status: status
-  })
-end
+    def self.validates_option(option, settings)
+      @option_validations ||= []
+      @option_validations << [option, settings]
+    end
 
-def validate_args_min_length!(arr, length, msg = nil)
-  validate_option! (arr.length >= length), msg
-end
+    attr_accessor :arguments
+    attr_accessor :options
 
-def validate_option!(expr, msg = nil)
-  raise OptionValidationError.new(msg) unless expr
-end
+    def initialize(arguments, options)
+      self.arguments = arguments
+      self.options = load_options_from_config(options.config_file).merge(options.__hash__)
+      validate_options
+    end
 
-def validate_pagerduty_date(date, msg = nil)
-  # FIXME: Validate actual format, not just not-null
-  validate_option! date, msg
-end
+    def load_options_from_config(config_file)
+      return {} unless File.exist?(config_file)
 
-def validate_pagerduty_options!(options, msg = nil)
-  validate_option! options.api_key, 'No PagerDuty API key specified'
+      config = YAML.load_file(config_file)
+      return {} unless config.has_key?(config_section)
+
+      config[config_section]
+    end
+
+    private
+
+    def argument_validations
+      self.class.argument_validations || []
+    end
+
+    def config_section
+      self.class.config_section
+    end
+
+    def option_validations
+      self.class.option_validations || []
+    end
+
+    def validate_options
+      option_validations.each do |option, params|
+        if params[:required] and options[option].nil?
+          raise OptionValidationError, "Required option '#{option}' not provided"
+        end
+
+        if params[:kind_of] and not (options[option].kind_of?(params[:kind_of]) or options[option].nil?)
+          raise OptionValidationError, "Expected option '#{option}' to be a kind of #{params[:kind_of]}"
+        end
+      end
+    end
+  end
+
+  class PagerdutyBase < Command
+    imports_from_config :pagerduty
+
+    validates_option :client,
+      required: false,
+      kind_of: String
+
+    validates_option :details,
+      required: false,
+      kind_of: String
+
+    validates_option :service_key,
+      required: true,
+      kind_of: String
+
+    validates_option :subdomain,
+      required: true,
+      kind_of: String
+  end
+
+  class PagerdutyIncidentFromCommand < PagerdutyBase
+    validates_option :incident_key,
+      required: true,
+      kind_of: String
+
+    def run
+      validate_arguments
+      cmd = Mixlib::ShellOut.new(arguments)
+      $logger.debug "Running command: #{arguments.inspect}"
+      result = cmd.run_command
+      if result.status.success?
+        resolve_incident result
+      else
+        trigger_incident result
+      end
+    end
+
+    private
+
+    def description_for_trigger(result)
+      if result.stdout.length > 0
+        output = result.stdout
+      elsif result.stderr.length > 0
+        output = result.stderr
+      else
+        output = 'No output provided'
+      end
+
+      "Command #{arguments.inspect} returned output:\n\n#{output}"
+    end
+
+    def options_for_resolve(result)
+      {
+        incident_key: options[:incident_key],
+        service_key: options[:service_key]
+      }
+    end
+
+    def options_for_trigger(result)
+      {
+        client: options[:client],
+        client_url: options[:client_url],
+        description: description_for_trigger(result),
+        details: options[:details] || { stderr: result.stderr, stdout: result.stdout },
+        incident_key: options[:incident_key],
+        service_key: options[:service_key]
+      }
+    end
+
+    def resolve_incident(result)
+      options = options_for_resolve(result)
+      $logger.debug "Command returned success, resolving incident with options: #{options}"
+      resp = Redphone::Pagerduty.resolve_incident(options)
+      if resp['status'] == 'success'
+        $logger.debug 'Successfully resolved PagerDuty incident'
+      else
+        $logger.error "Failed to resolve PagerDuty incident; got response: #{resp['message']}"
+        exit 1
+      end
+    end
+
+    def trigger_incident(result)
+      options = options_for_trigger(result)
+      $logger.debug "Command returned failure, triggering incident with options: #{options}"
+      resp = Redphone::Pagerduty.trigger_incident(options)
+      if resp['status'] == 'success'
+        $logger.debug 'Successfully triggered PagerDuty incident'
+      else
+        $logger.error "Failed to trigger PagerDuty incident; got response: #{resp['message']}"
+        exit 1
+      end
+    end
+
+    def validate_arguments
+      if arguments.empty?
+        raise OptionValidationError, 'No command specified!'
+      end
+    end
+  end
 end
 
 Commander.configure do
   program :name, 'redphone-cli'
   program :version, '0.1.0'
-  program :description, 'Interact with monitoring services'
-  program :help, 'Author', 'Rabbit, Inc.'
+  program :description, 'CLI for interacting with monitoring services'
+  program :help, 'Author', 'Jeff Goldschrafe <jeff@rabb.it>'
 
-  global_option '-f', '--config-file PATH', 'Config file path'
-  global_option '-d', '--debug', 'Display debug output' do |d|
-    logger.level = Logger::DEBUG
-  end
-
-  command :'pagerduty incident acknowledge' do |c|
-    c.syntax = 'redphone-cli pagerduty incident acknowledge [options] INCIDENT-KEY'
-    c.description = 'Acknowledge a PagerDuty incident (required)'
-    c.option '-k', '--api-key STRING', 'PagerDuty API key (required)'
-
-    c.action do |args, options|
-      options.default default_config(:pagerduty, options.config_file)
-
-      begin
-        validate_pagerduty_options! options
-        validate_args_min_length! args, 1, 'No incident key specified'
-      rescue OptionValidationError => e
-        handle_option_error(e)
-      end
-    end
-  end
+  global_option('-d', '--debug', 'Enable debug logging') { $logger.level = Logger::DEBUG }
+  global_option('-f', '--config-file FILE', String, 'Configuration file to load')
 
   command :'pagerduty incident from command' do |c|
-    c.syntax = 'redphone-cli pagerduty incident from command [options] INCIDENT-KEY command'
-    c.description = 'Either create or resolve a PagerDuty incident from the results of a command'
-    c.option '-c', '--client STRING', 'Name of the client triggering the event (required)'
-    c.option '-k', '--api-key STRING', 'PagerDuty API key (required)'
-    c.option '--client-url', 'Client URL to attach to PagerDuty incident'
-    c.option '--details', 'JSON to be stored with the event'
+    c.option('--client STRING', String, 'Name of the client triggering the event')
+    c.option('--service-key STRING', String, 'PagerDuty service API key')
+    c.option('--subdomain STRING', String, 'PagerDuty subdomain')
+    c.option('--incident-key STRING', String, 'Incident key identifying the incident')
+    c.option('--details STRING', String, 'JSON metadata to be stored with the event')
 
     c.action do |args, options|
-      options.default default_config(:pagerduty, options.config_file)
-
-      begin
-        validate_pagerduty_options! options
-        validate_option! options.client, 'No client name specified'
-        validate_args_min_length! args, 1, 'No incident key specified'
-        validate_args_min_length! args, 2, 'No command specified'
-        incident_key = args[0]
-        command = args[1..-1]
-      rescue OptionValidationError => e
-        handle_option_error(e)
-      end
-
-      logger.debug "Executing command: #{command.inspect}"
-      result = run_command(*command)
-      if result.status.success?
-        logger.debug "Command returned success, resolving PagerDuty alert"
-        resolve_opts = pagerduty_options(options, {incident_key: incident_key})
-        logger.debug "Resolving incident with: #{resolve_opts.inspect}"
-        resp = Redphone::Pagerduty.resolve_incident(resolve_opts)
-        if resp['status'] == 'success'
-          logger.debug "Successfully resolved incident: #{resp['message']}"
-        else
-          logger.error "Failed to resolve incident: #{resp['message']}"
-          exit 1
-        end
-      else
-        logger.debug "Command returned failure, triggering PagerDuty alert"
-        trigger_opts = pagerduty_options(options, {
-          client: options.client,
-          client_url: options.client_url,
-          description: result.stdout || result.stderr || 'No output provided',
-          details: options.details || { stderr: result.stderr, stdout: result.stdout },
-          incident_key: incident_key
-        })
-        logger.debug "Triggering incident with: #{trigger_opts.inspect}"
-        resp = Redphone::Pagerduty.trigger_incident(trigger_opts)
-        if resp['status'] == 'success'
-          logger.debug "Successfully triggered incident: #{resp['message']}"
-        else
-          logger.error "Failed to trigger incident: #{resp['message']}"
-          exit 1
-        end
-      end
+      options.default make_defaults(client: hostname)
+      cmd = RedphoneCli::PagerdutyIncidentFromCommand.new(args, options)
+      cmd.run
     end
   end
-
-  # command :'pagerduty incident list' do |c|
-  #   c.syntax = 'redphone-cli pagerduty incident list [options]'
-  #   c.description = 'List open incidents'
-  #   c.option '-k', '--api-key STRING', 'PagerDuty API key (required)'
-  #   c.option '--since', 'Filter incidents by start date'
-  #   c.option '--until', 'Filter incidents by end date'
-  #   c.option '--status', 'Filter incidents by status'
-
-  #   c.action do |args, options|
-  #     options.default default_config(:pagerduty, options.config_file)
-
-  #     begin
-  #       validate_pagerduty_options! options
-  #       validate_pagerduty_date! options.since, 'Invalid "since" date specified'
-  #       validate_pagerduty_date! options.until, 'Invalid "until" date specified'
-  #       validate_option! options.client, 'No client name specified'
-  #     rescue OptionValidationError => e
-  #       handle_option_error(e)
-  #     end
-  #   end
-  # end
-  #
-  # command :'pagerduty incident resolve' do |c|
-  #   c.syntax = 'redphone-cli pagerduty incident resolve [options] INCIDENT-KEY'
-  #   c.description = 'Resolve a PagerDuty incident'
-  #   c.option '-c', '--client STRING', 'Name of the client triggering the event (required)'
-  #   c.option '-k', '--api-key STRING', 'PagerDuty API key (required)'
-
-  #   c.action do |args, options|
-  #     options.default default_config(:pagerduty, options.config_file)
-
-  #     begin
-  #       validate_pagerduty_options! options
-  #       validate_option! options.client, 'No client name specified'
-  #       validate_args_min_length! args, 1, 'No incident key specified'
-  #       incident_key = args[0]
-  #     rescue OptionValidationError => e
-  #       handle_option_error(e)
-  #     end
-  #   end
-  # end
-
-  # command :'pagerduty incident show' do |c|
-  #   c.syntax = 'redphone-cli pagerduty incident show [options] INCIDENT-KEY'
-  #   c.description = 'Show an open incident'
-  #   c.option '-k', '--api-key STRING', 'PagerDuty API key (required)'
-
-  #   c.action do |args, options|
-  #     options.default default_config(:pagerduty, options.config_file)
-
-  #     begin
-  #       validate_pagerduty_options! options
-  #       validate_option! options.client, 'No client name specified'
-  #       validate_args_min_length! args, 1, 'No incident key specified'
-  #       incident_key = args[0]
-  #     rescue OptionValidationError => e
-  #       handle_option_error(e)
-  #     end
-  #   end
-  # end
-
-  # command :'pagerduty incident trigger' do |c|
-  #   c.syntax = 'redphone-cli pagerduty incident create [options] INCIDENT-KEY'
-  #   c.description = 'Create a PagerDuty incident'
-  #   c.option '-c, --client STRING', 'Name of the client triggering the event (required)'
-  #   c.option '-k, --api-key STRING', 'PagerDuty API key (required)'
-  #   c.option '--client-url', 'Client URL'
-  #   c.option '--details', 'JSON object containing incident details'
-
-  #   c.action do |args, options|
-  #     options.default default_config(:pagerduty, options.config_file)
-
-  #     begin
-  #       validate_pagerduty_options! options
-  #       validate_option! options.client, 'No client name specified'
-  #       validate_args_min_length! args, 1, 'No incident key specified'
-  #       incident_key = args[0]
-  #     rescue OptionValidationError => e
-  #       handle_option_error(e)
-  #     end
-  #   end
-  # end
 end
